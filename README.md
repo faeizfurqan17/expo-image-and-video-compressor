@@ -26,7 +26,7 @@
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [API Reference](#api-reference)
-  - [compress()](#compressfileurl-options-onprogress)
+  - [compressVideo()](#compressfileurl-options-onprogress)
   - [compressImage()](#compressimagefileurl-options)
   - [cancel()](#canceluuid)
   - [getMetadata()](#getmetadatafileurl)
@@ -100,13 +100,14 @@ yarn add expo-image-and-video-compressor
 ### Compress a Video
 
 ```ts
-import { compress } from 'expo-image-and-video-compressor';
+import { compressVideo } from 'expo-image-and-video-compressor';
 
-const result = await compress(videoUri, {
-  bitrate: 2_500_000,   // 2.5 Mbps
-  maxSize: 1080,         // Scale down to 1080p
-  codec: 'h264',         // or 'hevc' for ~40% smaller output
-  speed: 'ultrafast',    // Fastest encoding
+const result = await compressVideo(videoUri, {
+  videoEncodingMode: 'vbr',        // use Variable Bitrate Encoding
+  videoBitrateTarget: 2_500_000,   // 2.5 Mbps
+  videoMaxDimensionLongEdge: 1080, // Scale down to 1080p
+  videoCodec: 'h264',              // or 'hevc' for ~40% smaller output
+  speed: 'ultrafast',              // Fastest encoding
 }, (progress) => {
   console.log(`Compressing: ${Math.round(progress * 100)}%`);
 });
@@ -132,11 +133,11 @@ console.log('Compressed image:', result);
 ### Cancel an In-Progress Compression
 
 ```ts
-import { compress, cancel } from 'expo-image-and-video-compressor';
+import { compressVideo, cancel } from 'expo-image-and-video-compressor';
 
 let cancellationId: string;
 
-const promise = compress(videoUri, {
+const promise = compressVideo(videoUri, {
   getCancellationId: (id) => {
     cancellationId = id;
   },
@@ -159,14 +160,14 @@ console.log(meta);
 ### Background Compression (iOS)
 
 ```ts
-import { compress, activateBackgroundTask, deactivateBackgroundTask } from 'expo-image-and-video-compressor';
+import { compressVideo, activateBackgroundTask, deactivateBackgroundTask } from 'expo-image-and-video-compressor';
 
 // Keep compression alive when app goes to background
 await activateBackgroundTask(() => {
   console.log('Background time is about to expire');
 });
 
-const result = await compress(largeVideoUri);
+const result = await compressVideo(largeVideoUri);
 
 deactivateBackgroundTask();
 ```
@@ -175,7 +176,7 @@ deactivateBackgroundTask();
 
 ## API Reference
 
-### `compress(fileUrl, options?, onProgress?)`
+### `compressVideo(fileUrl, options?, onProgress?)`
 
 Compresses a video file using the device's hardware encoder.
 
@@ -191,10 +192,17 @@ Compresses a video file using the device's hardware encoder.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `bitrate` | `number` | Auto | Target bitrate in bits per second. Auto-calculated from resolution when omitted. |
-| `maxSize` | `number` | `1080` | Maximum output dimension (width or height) in pixels. Aspect ratio is preserved. |
-| `codec` | `'h264' \| 'hevc'` | `'h264'` | Output video codec. HEVC produces ~40% smaller files but requires iOS 11+ / Android 5+. |
+| `videoMaxDimensionShortEdge` | `number` |  | Maximum output dimension (width or height) in pixels. Aspect ratio is preserved. (e.g. given a input resolution `2420 × 1668` with `videoMaxDimensionShortEdge: 1080`, the output resolution will be `1566 × 1080`) |
+| `videoMaxDimensionLongEdge` | `number` |  | Maximum output dimension (width or height) in pixels. Aspect ratio is preserved. (e.g. given a input resolution `2420 × 1668` with `videoMaxDimensionLongEdge: 1080`, the output resolution will be `1080 × 744`) |
+| `videoCodec` | `'h264' \| 'hevc'` | `'h264'` | Output video videoCodec. HEVC produces ~40% smaller files but requires iOS 11+ / Android 5+. |
 | `speed` | `'ultrafast' \| 'fast' \| 'balanced'` | `'ultrafast'` | Encoding speed preset. Faster = larger file, slower = better compression ratio. |
+| `videoEncodingMode` | `'vbr' \| 'cbr' \| 'cq'` | `'vbr'` | Rate control. Android: `BITRATE_MODE_CBR`/`VBR` (CBR falls back to VBR if the encoder lacks it). iOS: no true CBR in AVAssetWriter, so `'cbr'` is approximated with a 1-second data-rate cap equal to `videoBitrateTarget`. |
+| `videoBitrateTarget` | `number` | Auto | Target bitrate in bits per second. Auto-calculated from resolution when omitted. |
+| `videoBitrateMax` | `number` | none | Peak cap in bps (like ffmpeg `-maxrate`). **VBR and CQ only** (a type error with `videoEncodingMode: 'cbr'`). iOS: enforced via `kVTCompressionPropertyKey_DataRateLimits`. Android: `max-bitrate` format key, only honored by some encoders. |
+| `videoQuality` | `number` | `0.5` | 0–1. **CQ only** (like ffmpeg `-crf`; `videoBitrateTarget` is ignored). iOS: `kVTCompressionPropertyKey_Quality`. Android: `BITRATE_MODE_CQ`, falling back to VBR if the encoder lacks it. Output size depends on content. |
+| `videoKeyframeInterval` | `number` | Android: `1`, iOS: encoder default | Max keyframe interval in seconds. Shorter = faster seeking, larger files. |
+| `audioCodec` | `'aac' \| 'copy'` | iOS `'aac'`; Android `'copy'` (or `'aac'` if `audioBitrate` is set) | `'aac'` re-encodes to AAC-LC; `'copy'` keeps the original audio stream. |
+| `audioBitrate` | `number` | `128000` | AAC bitrate in bps. Ignored with `'copy'`. |
 | `minimumFileSizeForCompress` | `number` | `0` | Skip compression if the source file is smaller than this value (in bytes). |
 | `getCancellationId` | `(id: string) => void` | — | Callback that receives a unique ID. Pass this ID to `cancel()` to abort compression. |
 | `progressDivider` | `number` | `0` | Throttle progress events. `0` = report every frame, `5` = report every 5%. |
@@ -290,9 +298,9 @@ Ends the iOS background task. Call this after compression completes.
 HEVC (H.265) produces approximately **40% smaller files** at the same visual quality compared to H.264. Use it when targeting modern devices:
 
 ```ts
-const result = await compress(videoUri, {
-  codec: 'hevc',
-  maxSize: 1080,
+const result = await compressVideo(videoUri, {
+  videoCodec: 'hevc',
+  videoMaxDimensionLongEdge: 1080,
   speed: 'fast',
 });
 ```
@@ -304,17 +312,18 @@ const result = await compress(videoUri, {
 A common pattern for chat apps and social media:
 
 ```ts
-import { compress, compressImage, getMetadata } from 'expo-image-and-video-compressor';
+import { compressVideo, compressImage, getMetadata } from 'expo-image-and-video-compressor';
 
 async function prepareForUpload(uri: string, type: 'video' | 'image') {
   if (type === 'video') {
     const meta = await getMetadata(uri);
     console.log(`Original: ${(meta.size / 1_000_000).toFixed(1)} MB`);
 
-    const compressed = await compress(uri, {
-      bitrate: 2_500_000,
-      maxSize: 720,
-      codec: 'hevc',
+    const compressed = await compressVideo(uri, {
+      videoEncodingMode: 'vbr',
+      videoBitrateTarget: 2_500_000,
+      videoMaxDimensionLongEdge: 720,
+      videoCodec: 'hevc',
     }, (p) => updateProgressBar(p));
 
     const newMeta = await getMetadata(compressed);
@@ -335,7 +344,7 @@ async function prepareForUpload(uri: string, type: 'video' | 'image') {
 Avoid unnecessary compression on files that are already small:
 
 ```ts
-const result = await compress(videoUri, {
+const result = await compressVideo(videoUri, {
   minimumFileSizeForCompress: 5_000_000, // Skip if under 5 MB
 });
 ```
@@ -349,7 +358,7 @@ const result = await compress(videoUri, {
 | **H.264 & HEVC encoding** | Hardware-accelerated video encoding via platform APIs |
 | **Image compression** | JPEG and PNG compression with resize and quality control |
 | **Frame dropping** | Automatically drops frames for high-fps sources to reduce output size |
-| **Auto-scaling** | Respects aspect ratio — set `maxSize` and let the encoder handle the rest |
+| **Auto-scaling** | Respects aspect ratio — set `videoMaxDimensionLongEdge` / `videoMaxDimensionShortEdge` and let the encoder handle the rest |
 | **Orientation handling** | Correctly preserves portrait and landscape orientation for both images and video |
 | **EXIF preservation** | Copies metadata from source to compressed images |
 | **Audio pass-through** | Copies the audio track without re-encoding — no quality loss |

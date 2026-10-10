@@ -1,15 +1,15 @@
 import { NativeModule, requireNativeModule } from 'expo';
 
-import { BayutVideoCompressorModuleEvents, CompressOptions, ImageCompressOptions, VideoMetadata } from './BayutVideoCompressor.types';
+import type { BayutVideoCompressorModuleEvents, CompressOptions, ImageCompressOptions, VideoMetadata } from './BayutVideoCompressor.types';
 
 declare class BayutVideoCompressorModule extends NativeModule<BayutVideoCompressorModuleEvents> {
   /**
    * Compress a video file with hardware acceleration.
    * @param fileUrl - File URI of the video to compress
-   * @param options - Compression options (bitrate, maxSize, codec, speed)
+   * @param options - Compression options
    * @returns Promise resolving to the compressed file URI
    */
-  compress(fileUrl: string, options: CompressOptions): Promise<string>;
+  video_compress(fileUrl: string, options: CompressOptions): Promise<string>;
 
   /**
    * Compress an image file.

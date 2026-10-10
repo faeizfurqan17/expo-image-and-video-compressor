@@ -19,7 +19,7 @@ class BayutVideoCompressorModule : Module() {
 
         // MARK: - Compress
 
-        AsyncFunction("compress") { fileUrl: String, options: Map<String, Any?> ->
+        AsyncFunction("video_compress") { fileUrl: String, options: Map<String, Any?> ->
             val uuid = options["uuid"] as? String ?: java.util.UUID.randomUUID().toString()
             val cancelled = AtomicBoolean(false)
             activeCompressions[uuid] = cancelled
@@ -29,10 +29,17 @@ class BayutVideoCompressorModule : Module() {
                     ?: throw IllegalStateException("React context not available")
 
                 val config = VideoCompressor.CompressConfig(
-                    maxSize = (options["maxSize"] as? Number)?.toInt() ?: 1080,
-                    bitrate = (options["bitrate"] as? Number)?.toInt() ?: 0,
-                    codec = options["codec"] as? String ?: "h264",
+                    videoMaxDimensionLongEdge = (options["videoMaxDimensionLongEdge"] as? Number)?.toInt() ?: 0,
+                    videoMaxDimensionShortEdge = (options["videoMaxDimensionShortEdge"] as? Number)?.toInt() ?: 0,
+                    videoBitrateTarget = (options["videoBitrateTarget"] as? Number)?.toInt() ?: 0,
                     speed = options["speed"] as? String ?: "ultrafast",
+                    videoEncodingMode = options["videoEncodingMode"] as? String ?: "vbr",
+                    videoCodec = options["videoCodec"] as? String ?: "h264",
+                    videoQuality = (options["videoQuality"] as? Number)?.toFloat() ?: 0.5f,
+                    videoBitrateMax = (options["videoBitrateMax"] as? Number)?.toInt() ?: 0,
+                    videoKeyframeInterval = (options["videoKeyframeInterval"] as? Number)?.toFloat() ?: 0f,
+                    audioCodec = options["audioCodec"] as? String,
+                    audioBitrate = (options["audioBitrate"] as? Number)?.toInt() ?: 0,
                 )
 
                 val minimumFileSize = (options["minimumFileSizeForCompress"] as? Number)?.toDouble() ?: 0.0
@@ -84,7 +91,7 @@ class BayutVideoCompressorModule : Module() {
             val context = appContext.reactContext
                 ?: throw IllegalStateException("React context not available")
 
-            val config = ImageCompressor.ImageCompressConfig(
+            val config = ImageCompressor.CompressConfig(
                 maxWidth = (options["maxWidth"] as? Number)?.toInt() ?: 1280,
                 maxHeight = (options["maxHeight"] as? Number)?.toInt() ?: 1280,
                 quality = (options["quality"] as? Number)?.toFloat() ?: 0.8f,

@@ -20,13 +20,21 @@ class VideoCompressor(private val context: Context) {
     companion object {
         private const val TAG = "BayutCompressor"
         private const val I_FRAME_INTERVAL = 1
+        private const val DEFAULT_AUDIO_BITRATE = 128_000
     }
 
     data class CompressConfig(
-        val maxSize: Int = 1080,
-        val bitrate: Int = 0,
-        val codec: String = "h264",
+        val videoMaxDimensionLongEdge: Int = 0,
+        val videoMaxDimensionShortEdge: Int = 0,
+        val videoBitrateTarget: Int = 0,
         val speed: String = "ultrafast",
+        val videoEncodingMode: String = "vbr",
+        val videoCodec: String = "h264",
+        val videoQuality: Float = 0.5f,
+        val videoBitrateMax: Int = 0,
+        val videoKeyframeInterval: Float = 0f,
+        val audioCodec: String? = null,
+        val audioBitrate: Int = 0,
     )
 
     interface ProgressListener {
@@ -54,15 +62,15 @@ class VideoCompressor(private val context: Context) {
         val sourceBitrate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toIntOrNull() ?: 5_000_000
         retriever.release()
 
-        val (outputWidth, outputHeight) = calculateOutputSize(sourceWidth, sourceHeight, config.maxSize, rotation)
+        val (outputWidth, outputHeight) = calculateOutputSize(sourceWidth, sourceHeight, config.videoMaxDimensionLongEdge, config.videoMaxDimensionShortEdge, rotation)
 
-        val outputBitrate = if (config.bitrate > 0) {
-            config.bitrate
+        val outputBitrate = if (config.videoBitrateTarget > 0) {
+            config.videoBitrateTarget
         } else {
             calculateAutoBitrate(outputWidth, outputHeight, sourceBitrate, config.speed)
         }
 
-        val mimeType = when (config.codec) {
+        val mimeType = when (config.videoCodec) {
             "hevc" -> MediaFormat.MIMETYPE_VIDEO_HEVC
             else -> MediaFormat.MIMETYPE_VIDEO_AVC
         }
@@ -82,13 +90,46 @@ class VideoCompressor(private val context: Context) {
         if (videoTrackIndex < 0) throw IllegalStateException("No video track found")
         val audioTrackIndex = findTrack(extractor, false)
 
+        // Audio source: the original track (pass-through) or a temp AAC re-encode.
+        // Default is pass-through unless an audioBitrate is requested.
+        val reencodeAudio = audioTrackIndex >= 0 &&
+            (config.audioCodec == "aac" || (config.audioCodec == null && config.audioBitrate > 0))
+        var audioTempFile: File? = null
+        var audioExtractor: MediaExtractor? = null
+        var audioSourceFd: android.os.ParcelFileDescriptor? = null
+        var audioSourceTrack = -1
+        if (audioTrackIndex >= 0) {
+            if (reencodeAudio) {
+                val tmp = File(context.cacheDir, "audio_${System.nanoTime()}.m4a")
+                val aacBitrate = if (config.audioBitrate > 0) config.audioBitrate else DEFAULT_AUDIO_BITRATE
+                if (transcodeAudioToAac(inputUri, tmp, aacBitrate)) {
+                    audioTempFile = tmp
+                    audioExtractor = MediaExtractor().apply { setDataSource(tmp.absolutePath) }
+                } else {
+                    tmp.delete()
+                    Log.w(TAG, "Audio re-encode failed, falling back to pass-through")
+                }
+            }
+            if (audioExtractor == null) {
+                audioSourceFd = context.contentResolver.openFileDescriptor(inputUri, "r")
+                audioExtractor = MediaExtractor().apply { setDataSource(audioSourceFd!!.fileDescriptor) }
+            }
+            audioSourceTrack = findTrack(audioExtractor, false)
+        }
+
         // Set up encoder
         val outputFormat = MediaFormat.createVideoFormat(mimeType, outputWidth, outputHeight).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, outputBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, 30)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
-            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+            if (config.videoKeyframeInterval > 0f && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N_MR1) {
+                setFloat(MediaFormat.KEY_I_FRAME_INTERVAL, config.videoKeyframeInterval)
+            } else {
+                setInteger(
+                    MediaFormat.KEY_I_FRAME_INTERVAL,
+                    if (config.videoKeyframeInterval > 0f) Math.round(config.videoKeyframeInterval).coerceAtLeast(1) else I_FRAME_INTERVAL
+                )
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 setInteger(MediaFormat.KEY_PRIORITY, 0)  // Realtime priority
                 setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt())  // Max speed
@@ -97,6 +138,28 @@ class VideoCompressor(private val context: Context) {
 
         val encoder = findHardwareEncoder(mimeType, outputFormat)
         Log.i(TAG, "Using encoder: ${encoder.name} (${if (isHardwareEncoder(encoder.name)) "HARDWARE" else "SOFTWARE"})")
+
+        val encoderCaps = encoder.codecInfo.getCapabilitiesForType(mimeType).encoderCapabilities
+        fun supports(mode: Int) = encoderCaps?.isBitrateModeSupported(mode) == true
+        val mode = when {
+            config.videoEncodingMode == "cbr" && supports(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR) ->
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+            config.videoEncodingMode == "cq" && supports(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ) ->
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ
+            else -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+        }
+        if (config.videoEncodingMode != "vbr" && mode == MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR) {
+            Log.w(TAG, "${config.videoEncodingMode.uppercase()} not supported by ${encoder.name}, falling back to VBR")
+        }
+        outputFormat.setInteger(MediaFormat.KEY_BITRATE_MODE, mode)
+        if (mode == MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ) {
+            // "videoQuality" is a 0-100 scale for CQ mode on most encoders (KEY_QUALITY, API 28+)
+            outputFormat.setInteger("videoQuality", (config.videoQuality.coerceIn(0f, 1f) * 100).toInt())
+        }
+        // Peak cap is vendor-dependent; unsupported encoders ignore the key.
+        if (mode != MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR && config.videoBitrateMax > 0) {
+            outputFormat.setInteger("max-bitrate", maxOf(config.videoBitrateMax, outputBitrate))
+        }
         encoder.configure(outputFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         val encoderInputSurface = encoder.createInputSurface()
         encoder.start()
@@ -227,12 +290,8 @@ class VideoCompressor(private val context: Context) {
                     encStatus == MediaCodec.INFO_TRY_AGAIN_LATER -> break
                     encStatus == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                         videoMuxTrack = muxer.addTrack(encoder.outputFormat)
-                        if (audioTrackIndex >= 0) {
-                            extractor.unselectTrack(videoTrackIndex)
-                            extractor.selectTrack(audioTrackIndex)
-                            audioMuxTrack = muxer.addTrack(extractor.getTrackFormat(audioTrackIndex))
-                            extractor.unselectTrack(audioTrackIndex)
-                            extractor.selectTrack(videoTrackIndex)
+                        if (audioExtractor != null && audioSourceTrack >= 0) {
+                            audioMuxTrack = muxer.addTrack(audioExtractor.getTrackFormat(audioSourceTrack))
                         }
                         muxer.start()
                         muxerStarted = true
@@ -259,11 +318,14 @@ class VideoCompressor(private val context: Context) {
 
         val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
 
-        // Audio pass-through
-        if (audioTrackIndex >= 0 && audioMuxTrack >= 0 && muxerStarted) {
-            processAudio(extractor, muxer, audioTrackIndex, audioMuxTrack)
+        // Audio: copy samples from the (original or re-encoded) audio source
+        if (audioExtractor != null && audioMuxTrack >= 0 && muxerStarted) {
+            processAudio(audioExtractor, muxer, audioSourceTrack, audioMuxTrack)
         }
 
+        try { audioExtractor?.release() } catch (_: Exception) {}
+        try { audioSourceFd?.close() } catch (_: Exception) {}
+        audioTempFile?.delete()
         cleanupAll(decoder, encoder, muxer, extractor, outputSurface, encoderInputSurface, fd)
 
         listener?.onProgress(1.0f)
@@ -319,7 +381,6 @@ class VideoCompressor(private val context: Context) {
         trackIndex: Int,
         muxTrackIndex: Int
     ) {
-        extractor.unselectTrack(findTrack(extractor, true))
         extractor.selectTrack(trackIndex)
         extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
 
@@ -338,6 +399,152 @@ class VideoCompressor(private val context: Context) {
         }
     }
 
+
+    /**
+     * Decodes the first audio track and re-encodes it as AAC-LC into a standalone .m4a.
+     * Returns false on any failure so the caller can fall back to pass-through.
+     */
+    private fun transcodeAudioToAac(inputUri: Uri, outFile: File, videoBitrateTarget: Int): Boolean {
+        val ex = MediaExtractor()
+        var pfd: android.os.ParcelFileDescriptor? = null
+        var decoder: MediaCodec? = null
+        var encoder: MediaCodec? = null
+        var muxer: MediaMuxer? = null
+        var muxerStarted = false
+        try {
+            pfd = context.contentResolver.openFileDescriptor(inputUri, "r") ?: return false
+            ex.setDataSource(pfd.fileDescriptor)
+            val track = findTrack(ex, false)
+            if (track < 0) return false
+            ex.selectTrack(track)
+            val inFmt = ex.getTrackFormat(track)
+            decoder = MediaCodec.createDecoderByType(inFmt.getString(MediaFormat.KEY_MIME)!!)
+            decoder.configure(inFmt, null, null, 0)
+            decoder.start()
+            muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+
+            val info = MediaCodec.BufferInfo()
+            var muxTrack = -1
+            var inputEos = false
+            var decoderEos = false
+            var encoderEos = false
+            var bytesPerSecond = 0L
+            var ptsUs = 0L
+
+            fun drainEncoder() {
+                val enc = encoder ?: return
+                while (true) {
+                    val encInfo = MediaCodec.BufferInfo()
+                    val idx = enc.dequeueOutputBuffer(encInfo, 0)
+                    when {
+                        idx == MediaCodec.INFO_TRY_AGAIN_LATER -> return
+                        idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                            muxTrack = muxer!!.addTrack(enc.outputFormat)
+                            muxer!!.start()
+                            muxerStarted = true
+                        }
+                        idx >= 0 -> {
+                            val buf = enc.getOutputBuffer(idx)!!
+                            if (encInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0 &&
+                                encInfo.size > 0 && muxerStarted) {
+                                buf.position(encInfo.offset)
+                                buf.limit(encInfo.offset + encInfo.size)
+                                muxer!!.writeSampleData(muxTrack, buf, encInfo)
+                            }
+                            enc.releaseOutputBuffer(idx, false)
+                            if (encInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                                encoderEos = true
+                                return
+                            }
+                        }
+                    }
+                }
+            }
+
+            while (!encoderEos) {
+                if (!inputEos) {
+                    val i = decoder.dequeueInputBuffer(0)
+                    if (i >= 0) {
+                        val size = ex.readSampleData(decoder.getInputBuffer(i)!!, 0)
+                        if (size < 0) {
+                            decoder.queueInputBuffer(i, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inputEos = true
+                        } else {
+                            decoder.queueInputBuffer(i, 0, size, ex.sampleTime, 0)
+                            ex.advance()
+                        }
+                    }
+                }
+
+                if (!decoderEos) {
+                    val o = decoder.dequeueOutputBuffer(info, 0)
+                    if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED && encoder == null) {
+                        // Configure the encoder from what the decoder really outputs
+                        // (e.g. HE-AAC may double the sample rate).
+                        val pcm = decoder.outputFormat
+                        val sr = pcm.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                        val ch = pcm.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                        bytesPerSecond = sr.toLong() * ch * 2
+                        val encFmt = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sr, ch).apply {
+                            setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+                            setInteger(MediaFormat.KEY_BIT_RATE, videoBitrateTarget)
+                        }
+                        encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).also {
+                            it.configure(encFmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                            it.start()
+                        }
+                    } else if (o >= 0) {
+                        val enc = encoder ?: return false
+                        val pcmBuf = decoder.getOutputBuffer(o)!!
+                        var pos = info.offset
+                        var remaining = info.size
+                        var chunkPts = info.presentationTimeUs
+                        while (remaining > 0) {
+                            val ei = enc.dequeueInputBuffer(10_000)
+                            if (ei < 0) { drainEncoder(); continue }
+                            val eb = enc.getInputBuffer(ei)!!
+                            eb.clear()
+                            val n = minOf(remaining, eb.capacity())
+                            pcmBuf.position(pos)
+                            pcmBuf.limit(pos + n)
+                            eb.put(pcmBuf)
+                            enc.queueInputBuffer(ei, 0, n, chunkPts, 0)
+                            pos += n
+                            remaining -= n
+                            chunkPts += n * 1_000_000L / bytesPerSecond
+                            drainEncoder()
+                        }
+                        if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                            decoderEos = true
+                            var queued = false
+                            while (!queued) {
+                                val ei = enc.dequeueInputBuffer(10_000)
+                                if (ei < 0) { drainEncoder(); continue }
+                                enc.queueInputBuffer(ei, 0, 0, chunkPts, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                queued = true
+                            }
+                        }
+                        decoder.releaseOutputBuffer(o, false)
+                    }
+                }
+                drainEncoder()
+            }
+            return muxerStarted
+        } catch (e: Exception) {
+            Log.w(TAG, "Audio transcode error: ${e.message}")
+            return false
+        } finally {
+            try { decoder?.stop() } catch (_: Exception) {}
+            try { decoder?.release() } catch (_: Exception) {}
+            try { encoder?.stop() } catch (_: Exception) {}
+            try { encoder?.release() } catch (_: Exception) {}
+            try { if (muxerStarted) muxer?.stop() } catch (_: Exception) {}
+            try { muxer?.release() } catch (_: Exception) {}
+            try { ex.release() } catch (_: Exception) {}
+            try { pfd?.close() } catch (_: Exception) {}
+        }
+    }
+
     private fun findTrack(extractor: MediaExtractor, isVideo: Boolean): Int {
         for (i in 0 until extractor.trackCount) {
             val mime = extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: continue
@@ -347,11 +554,19 @@ class VideoCompressor(private val context: Context) {
         return -1
     }
 
-    private fun calculateOutputSize(srcW: Int, srcH: Int, maxSize: Int, rotation: Int): Pair<Int, Int> {
+    private fun calculateOutputSize(srcW: Int, srcH: Int, videoMaxDimensionLongEdge: Int, videoMaxDimensionShortEdge: Int, rotation: Int): Pair<Int, Int> {
         val w = if (rotation == 90 || rotation == 270) srcH else srcW
         val h = if (rotation == 90 || rotation == 270) srcW else srcH
-        val scale = if (h > w) (maxSize.toFloat() / h).coerceAtMost(1f)
-                    else (maxSize.toFloat() / w).coerceAtMost(1f)
+
+        if (videoMaxDimensionLongEdge <= 0 && videoMaxDimensionShortEdge <= 0)
+            return Pair(w, h)
+
+        // A limit <= 0 means "unset". Long edge caps max(w, h), short edge caps min(w, h).
+        val srcLong = maxOf(w, h).toFloat()
+        val srcShort = minOf(w, h).toFloat()
+        var scale = 1f
+        if (videoMaxDimensionLongEdge > 0) scale = minOf(scale, videoMaxDimensionLongEdge / srcLong)
+        if (videoMaxDimensionShortEdge > 0) scale = minOf(scale, videoMaxDimensionShortEdge / srcShort)
         return Pair((Math.round(w * scale / 2f) * 2), (Math.round(h * scale / 2f) * 2))
     }
 

@@ -19,28 +19,119 @@ export type CompressionCodec = 'h264' | 'hevc';
 export type CompressionSpeed = 'ultrafast' | 'fast' | 'balanced';
 
 /**
+ * Rate control mode.
+ * - 'vbr': Variable bitrate. `bitrate` is a target average; the encoder floats with content complexity.
+ * - 'cq': Constant quality (like ffmpeg `-crf`). `videoQuality` sets the level and `bitrate` is ignored.
+ *   Falls back to VBR (using `bitrate`) if the encoder lacks support. Output size is content-dependent.
+ * - 'cbr': Constant bitrate. Android requests BITRATE_MODE_CBR (falls back to VBR if the encoder
+ *   lacks support). iOS has no guaranteed CBR through AVAssetWriter, so it uses the average bitrate
+ *   plus a tight 1-second data-rate cap as the closest approximation.
+ */
+export type BitrateMode = 'vbr' | 'cbr' | 'cq';
+
+/**
+ * Audio codec for the output. MP4 output only supports AAC re-encoding or stream copy.
+ */
+export type AudioCodec = 'aac' | 'copy';
+
+/**
  * Options for video compression.
  */
-export interface CompressOptions {
+export type CompressOptions = CompressOptionsBase &
+  (
+    | {
+        /**
+         * Rate control mode.
+         * Default: 'vbr'
+         */
+        videoEncodingMode?: 'vbr';
+
+        /**
+         * Peak bitrate cap in bits per second.
+         * - iOS: applied via `kVTCompressionPropertyKey_DataRateLimits` (1-second window); enforced.
+         * - Android: passed as the `max-bitrate` MediaFormat key; only honored by some encoders.
+         * Default: no cap.
+         * Example: 2_500_000 for 2.5 Mbps
+         */
+        videoBitrateMax?: number;
+        videoQuality?: never;
+      }
+    | {
+        videoEncodingMode: 'cq';
+
+        /**
+         * Peak bitrate cap in bits per second.
+         * - iOS: applied via `kVTCompressionPropertyKey_DataRateLimits` (1-second window); enforced.
+         * - Android: passed as the `max-bitrate` MediaFormat key; only honored by some encoders.
+         * Default: no cap.
+         * Example: 2_500_000 for 2.5 Mbps
+         */
+        videoBitrateMax?: number;
+
+        /**
+         * Quality from 0 (smallest) to 1 (best). Default: 0.5.
+         * - iOS: `kVTCompressionPropertyKey_Quality`.
+         * - Android: encoder `quality` key (0-100) in BITRATE_MODE_CQ.
+         */
+        videoQuality?: number;
+      }
+    | {
+        videoEncodingMode: 'cbr';
+        videoBitrateMax?: never;
+        videoQuality?: never;
+      }
+  );
+
+export interface CompressOptionsBase {
   /**
    * Target bitrate in bits per second.
    * Default: auto-calculated based on resolution.
    * Example: 2_500_000 for 2.5 Mbps
    */
-  bitrate?: number;
+  videoBitrateTarget?: number;
+  
+  /**
+   * Maximum keyframe (I-frame) interval in seconds.
+   * Shorter = faster seeking and error recovery, larger files; longer = better compression.
+   * Default: 1 on Android, encoder default on iOS.
+   */
+  videoKeyframeInterval?: number;
+
+  /**
+   * Audio codec.
+   * - 'aac': Re-encode to AAC-LC (uses `audioBitrate`, default 128 kbps).
+   * - 'copy': Keep the original audio stream untouched (`audioBitrate` is ignored).
+   * Default: iOS 'aac'; Android 'copy' unless `audioBitrate` is set, then 'aac'.
+   */
+  audioCodec?: AudioCodec;
+
+  /**
+   * Audio bitrate in bits per second for AAC output. Ignored with `audioCodec: 'copy'`.
+   * Default: 128_000
+   */
+  audioBitrate?: number;
 
   /**
    * Maximum output dimension (width or height).
    * The video will be scaled proportionally.
-   * Default: 1080
+   * Given the input resolution `2420 × 1668` with `videoMaxDimensionShortEdge: 1080`, 
+   * the output resolution will be `1566 × 1080`
    */
-  maxSize?: number;
+  videoMaxDimensionShortEdge?: number;
+
+  /**
+   * Maximum output dimension (width or height).
+   * The video will be scaled proportionally.
+   * Given a input resolution `2420 × 1668` with `videoMaxDimensionLongEdge: 1080`, 
+   * the output resolution will be `1080 × 744`.
+   */
+  videoMaxDimensionLongEdge?: number;
 
   /**
    * Video codec to use.
    * Default: 'h264'
    */
-  codec?: CompressionCodec;
+  videoCodec?: CompressionCodec;
 
   /**
    * Compression speed preset.

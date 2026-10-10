@@ -12,7 +12,7 @@ import {
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { useVideoPlayer, VideoView } from 'expo-video';
-import { compress, compressImage, cancel, getMetadata } from 'expo-image-and-video-compressor';
+import { compressVideo, compressImage, cancel, getMetadata } from 'expo-image-and-video-compressor';
 import type { CompressOptions } from 'expo-image-and-video-compressor';
 import { Image } from 'react-native';
 import { requireNativeModule } from 'expo';
@@ -109,8 +109,8 @@ export default function App() {
     setError(null);
 
     const options: CompressOptions = {
-      maxSize: selectedMaxSize,
-      codec: selectedCodec,
+      videoMaxDimensionLongEdge: selectedMaxSize,
+      videoCodec: selectedCodec,
       speed: selectedSpeed,
       getCancellationId: (id) => {
         cancellationId.current = id;
@@ -125,7 +125,7 @@ export default function App() {
       const inputMeta = await getMetadata(selectedVideo);
       const inputSize = inputMeta.size;
 
-      const outputUri = await compress(selectedVideo, options, (p) => {
+      const outputUri = await compressVideo(selectedVideo, options, (p) => {
         console.log(`Compression progress: ${Math.round(p * 100)}% (Session: ${cancellationId.current})`);
         setProgress(p);
       });

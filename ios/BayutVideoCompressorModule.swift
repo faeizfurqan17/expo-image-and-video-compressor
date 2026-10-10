@@ -15,18 +15,25 @@ public class BayutVideoCompressorModule: Module {
 
     // MARK: - Compress
 
-    AsyncFunction("compress") { (fileUrl: String, options: [String: Any]) -> String in
+    AsyncFunction("video_compress") { (fileUrl: String, options: [String: Any]) -> String in
       let uuid = options["uuid"] as? String ?? UUID().uuidString
 
       // Send UUID back via options callback (handled in JS layer)
       // Emit it as part of progress events
 
-      let maxSize = options["maxSize"] as? Int ?? 1080
-      let bitrate = options["bitrate"] as? Int ?? 0
-      let codec = options["codec"] as? String ?? "h264"
+      let videoMaxDimensionLongEdge = (options["videoMaxDimensionLongEdge"] as? NSNumber)?.intValue ?? 0
+      let videoMaxDimensionShortEdge = (options["videoMaxDimensionShortEdge"] as? NSNumber)?.intValue ?? 0
+      let videoBitrateTarget = (options["videoBitrateTarget"] as? NSNumber)?.intValue ?? 0
       let speed = options["speed"] as? String ?? "ultrafast"
-      let minimumFileSize = options["minimumFileSizeForCompress"] as? Double ?? 0
-      let progressDivider = options["progressDivider"] as? Int ?? 0
+      let videoEncodingMode = options["videoEncodingMode"] as? String ?? "vbr"
+      let videoCodec = options["videoCodec"] as? String ?? "h264"
+      let videoQuality = (options["videoQuality"] as? NSNumber)?.doubleValue ?? 0.5
+      let videoBitrateMax = (options["videoBitrateMax"] as? NSNumber)?.intValue ?? 0
+      let videoKeyframeInterval = (options["videoKeyframeInterval"] as? NSNumber)?.doubleValue ?? 0
+      let audioCodec = options["audioCodec"] as? String
+      let audioBitrate = (options["audioBitrate"] as? NSNumber)?.intValue ?? 0
+      let minimumFileSize = (options["minimumFileSizeForCompress"] as? NSNumber)?.doubleValue ?? 0
+      let progressDivider = (options["progressDivider"] as? NSNumber)?.intValue ?? 0
 
       let inputURL = URL(string: fileUrl)!
       let resolvedURL = self.resolveFileURL(inputURL)
@@ -54,13 +61,14 @@ public class BayutVideoCompressorModule: Module {
       let (outputWidth, outputHeight) = self.calculateOutputSize(
         sourceWidth: sourceWidth,
         sourceHeight: sourceHeight,
-        maxSize: CGFloat(maxSize)
+        videoMaxDimensionLongEdge: CGFloat(videoMaxDimensionLongEdge),
+        videoMaxDimensionShortEdge: CGFloat(videoMaxDimensionShortEdge)
       )
 
       // Calculate output bitrate
       let outputBitrate: Int
-      if bitrate > 0 {
-        outputBitrate = bitrate
+      if videoBitrateTarget > 0 {
+        outputBitrate = videoBitrateTarget
       } else {
         outputBitrate = self.calculateAutoBitrate(
           width: Int(outputWidth),
@@ -81,8 +89,14 @@ public class BayutVideoCompressorModule: Module {
         outputWidth: Int(outputWidth),
         outputHeight: Int(outputHeight),
         outputBitrate: outputBitrate,
-        codec: codec,
         speed: speed,
+        videoEncodingMode: videoEncodingMode,
+        videoCodec: videoCodec,
+        videoQuality: videoQuality,
+        videoBitrateMax: videoBitrateMax,
+        videoKeyframeInterval: videoKeyframeInterval,
+        audioCodec: audioCodec,
+        audioBitrate: audioBitrate,
         uuid: uuid,
         progressDivider: progressDivider
       )
@@ -103,9 +117,9 @@ public class BayutVideoCompressorModule: Module {
     // MARK: - Image Compress
 
     AsyncFunction("image_compress") { (value: String, options: [String: Any]) -> String in
-      let maxWidth = options["maxWidth"] as? Int ?? 1280
-      let maxHeight = options["maxHeight"] as? Int ?? 1280
-      let quality = options["quality"] as? Double ?? 0.8
+      let maxWidth = (options["maxWidth"] as? NSNumber)?.intValue ?? 1280
+      let maxHeight = (options["maxHeight"] as? NSNumber)?.intValue ?? 1280
+      let quality = (options["quality"] as? NSNumber)?.doubleValue ?? 0.8
       let output = options["output"] as? String ?? "jpg"
       let input = options["input"] as? String ?? "uri"
 
@@ -232,8 +246,14 @@ public class BayutVideoCompressorModule: Module {
     outputWidth: Int,
     outputHeight: Int,
     outputBitrate: Int,
-    codec: String,
     speed: String,
+    videoEncodingMode: String,
+    videoCodec: String,
+    videoQuality: Double,
+    videoBitrateMax: Int,
+    videoKeyframeInterval: Double,
+    audioCodec: String?,
+    audioBitrate: Int,
     uuid: String,
     progressDivider: Int
   ) async throws {
@@ -247,8 +267,8 @@ public class BayutVideoCompressorModule: Module {
     reader.add(readerOutput)
 
     // Set up writer
-    let codecType: AVVideoCodecType = codec == "hevc" ? .hevc : .h264
-    let profileLevel: String = codec == "hevc"
+    let codecType: AVVideoCodecType = videoCodec == "hevc" ? .hevc : .h264
+    let profileLevel: String = videoCodec == "hevc"
       ? kVTProfileLevel_HEVC_Main_AutoLevel as String
       : kVTProfileLevel_H264_High_AutoLevel as String
 
@@ -256,6 +276,28 @@ public class BayutVideoCompressorModule: Module {
       AVVideoAverageBitRateKey: outputBitrate,
       AVVideoProfileLevelKey: profileLevel,
     ]
+
+    // Constant quality: VideoToolbox picks the bitrate for the requested quality, so the
+    // average-bitrate key is dropped (videoBitrateMax can still cap peaks below).
+    if videoEncodingMode == "cq" {
+      compressionProps.removeValue(forKey: AVVideoAverageBitRateKey)
+      compressionProps[kVTCompressionPropertyKey_Quality as String] = min(max(videoQuality, 0), 1)
+    }
+
+    if videoKeyframeInterval > 0 {
+      compressionProps[AVVideoMaxKeyFrameIntervalDurationKey] = videoKeyframeInterval
+    }
+
+    // Rate control. AVAssetWriter has no true CBR switch, so CBR is approximated by
+    // capping the data rate at the target over a 1-second window. VBR may take an
+    // optional peak cap (videoBitrateMax).
+    let rateCap = videoEncodingMode == "cbr"
+      ? outputBitrate
+      : (videoBitrateMax > 0 ? (videoEncodingMode == "cq" ? videoBitrateMax : max(videoBitrateMax, outputBitrate)) : 0)
+    if rateCap > 0 {
+      // [bytes, seconds]
+      compressionProps[kVTCompressionPropertyKey_DataRateLimits as String] = [rateCap / 8, 1]
+    }
 
     // Speed optimizations
     if speed == "ultrafast" {
@@ -281,32 +323,47 @@ public class BayutVideoCompressorModule: Module {
     writer.shouldOptimizeForNetworkUse = true
     writer.add(writerInput)
 
-    // Audio: decompress to PCM then re-encode to AAC
+    // Audio: re-encode to AAC (default, 128 kbps) or pass the compressed samples through ('copy')
     var audioReaderOutput: AVAssetReaderTrackOutput?
     var audioWriterInput: AVAssetWriterInput?
 
     if let audioTrack = asset.tracks(withMediaType: .audio).first {
-      // Read as decompressed Linear PCM so writer can re-encode to AAC
-      let audioDecompressSettings: [String: Any] = [
-        AVFormatIDKey: kAudioFormatLinearPCM,
-        AVLinearPCMIsBigEndianKey: false,
-        AVLinearPCMIsFloatKey: false,
-        AVLinearPCMBitDepthKey: 16,
-        AVLinearPCMIsNonInterleaved: false,
-      ]
-      let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: audioDecompressSettings)
-      audioOutput.alwaysCopiesSampleData = false
-      reader.add(audioOutput)
-      audioReaderOutput = audioOutput
+      if audioCodec == "copy" {
+        let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+        audioOutput.alwaysCopiesSampleData = false
+        reader.add(audioOutput)
+        audioReaderOutput = audioOutput
 
-      let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: [
-        AVFormatIDKey: kAudioFormatMPEG4AAC,
-        AVEncoderBitRateKey: 128000,
-        AVNumberOfChannelsKey: 2,
-        AVSampleRateKey: 44100.0,
-      ])
-      writer.add(audioInput)
-      audioWriterInput = audioInput
+        let audioInput = AVAssetWriterInput(
+          mediaType: .audio,
+          outputSettings: nil,
+          sourceFormatHint: (audioTrack.formatDescriptions.first).map { $0 as! CMFormatDescription }
+        )
+        writer.add(audioInput)
+        audioWriterInput = audioInput
+      } else {
+        // Read as decompressed Linear PCM so writer can re-encode to AAC
+        let audioDecompressSettings: [String: Any] = [
+          AVFormatIDKey: kAudioFormatLinearPCM,
+          AVLinearPCMIsBigEndianKey: false,
+          AVLinearPCMIsFloatKey: false,
+          AVLinearPCMBitDepthKey: 16,
+          AVLinearPCMIsNonInterleaved: false,
+        ]
+        let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: audioDecompressSettings)
+        audioOutput.alwaysCopiesSampleData = false
+        reader.add(audioOutput)
+        audioReaderOutput = audioOutput
+
+        let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+          AVFormatIDKey: kAudioFormatMPEG4AAC,
+          AVEncoderBitRateKey: audioBitrate > 0 ? audioBitrate : 128000,
+          AVNumberOfChannelsKey: 2,
+          AVSampleRateKey: 44100.0,
+        ])
+        writer.add(audioInput)
+        audioWriterInput = audioInput
+      }
     }
 
     // Start processing
@@ -430,15 +487,17 @@ public class BayutVideoCompressorModule: Module {
     return url
   }
 
-  private func calculateOutputSize(sourceWidth: CGFloat, sourceHeight: CGFloat, maxSize: CGFloat) -> (CGFloat, CGFloat) {
-    let isPortrait = sourceHeight > sourceWidth
-    let scale: CGFloat
-
-    if isPortrait {
-      scale = min(maxSize / sourceHeight, 1.0)
-    } else {
-      scale = min(maxSize / sourceWidth, 1.0)
+  private func calculateOutputSize(sourceWidth: CGFloat, sourceHeight: CGFloat, videoMaxDimensionLongEdge: CGFloat, videoMaxDimensionShortEdge: CGFloat) -> (CGFloat, CGFloat) {
+    if videoMaxDimensionLongEdge <= 0 && videoMaxDimensionShortEdge <= 0 {
+      return (sourceWidth, sourceHeight)
     }
+
+    // A limit <= 0 means "unset". Long edge caps max(w, h), short edge caps min(w, h).
+    let sourceLong = max(sourceWidth, sourceHeight)
+    let sourceShort = min(sourceWidth, sourceHeight)
+    var scale: CGFloat = 1.0
+    if videoMaxDimensionLongEdge > 0 { scale = min(scale, videoMaxDimensionLongEdge / sourceLong) }
+    if videoMaxDimensionShortEdge > 0 { scale = min(scale, videoMaxDimensionShortEdge / sourceShort) }
 
     // Round to even numbers (required by video encoders)
     let w = round(sourceWidth * scale / 2.0) * 2.0
@@ -462,9 +521,9 @@ public class BayutVideoCompressorModule: Module {
 
     let baseBitrate = Float(pixels) * 1.5
     let targetBitrate = Int(baseBitrate * compressFactor)
-    let maxBitrate = 5_000_000
+    let videoBitrateMax = 5_000_000
 
-    return min(max(targetBitrate, 500_000), min(sourceBitrate, maxBitrate))
+    return min(max(targetBitrate, 500_000), min(sourceBitrate, videoBitrateMax))
   }
 
   private func createTempURL() -> URL {

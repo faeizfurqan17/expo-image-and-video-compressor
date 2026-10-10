@@ -44,7 +44,7 @@ object ImageCompressor {
         ExifInterface.TAG_WHITE_BALANCE,
     )
 
-    data class ImageCompressConfig(
+    data class CompressConfig(
         val maxWidth: Int = 1280,
         val maxHeight: Int = 1280,
         val quality: Float = 0.8f,
@@ -56,7 +56,7 @@ object ImageCompressor {
      * Main entry point: compress an image.
      * Returns the URI of the compressed image, or the original if compression didn't reduce size.
      */
-    fun compress(value: String, config: ImageCompressConfig, cacheDir: File): String {
+    fun compress(value: String, config: CompressConfig, cacheDir: File): String {
         Log.i(TAG, "Compressing image: maxWidth=${config.maxWidth}, maxHeight=${config.maxHeight}, quality=${config.quality}, output=${config.output}")
 
         // 1. Load bitmap
